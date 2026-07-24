@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 PoC - Disparador de Servicios Windows con Ejecución Robusta
 Requiere permisos de administrador
@@ -100,7 +101,7 @@ def es_administrador() -> bool:
 def validar_permisos() -> bool:
     """Valida y eleva permisos si es necesario"""
     if es_administrador():
-        logger.info("[✓] Script ejecutándose con permisos de administrador")
+        logger.info("[+] Script ejecutandose con permisos de administrador")
         return True
     
     logger.warning("[!] Se requieren permisos de administrador")
@@ -114,7 +115,7 @@ def validar_permisos() -> bool:
             )
             sys.exit(0)
         except Exception as e:
-            logger.error(f"[✗] No se pudo elevar permisos: {e}")
+            logger.error(f"[x] No se pudo elevar permisos: {e}")
             return False
     
     return False
@@ -123,11 +124,11 @@ def validar_permisos() -> bool:
 def validar_entorno() -> bool:
     """Valida que el entorno sea compatible"""
     if sys.platform != "win32":
-        logger.error("[✗] Este PoC solo funciona en Windows")
+        logger.error("[x] Este PoC solo funciona en Windows")
         return False
     
     if sys.version_info < (3, 8):
-        logger.error("[✗] Se requiere Python 3.8+")
+        logger.error("[x] Se requiere Python 3.8+")
         return False
     
     # Verificar que PowerShell está disponible
@@ -138,9 +139,9 @@ def validar_entorno() -> bool:
             timeout=5,
             check=True
         )
-        logger.info("[✓] PowerShell disponible")
+        logger.info("[+] PowerShell disponible")
     except Exception as e:
-        logger.error(f"[✗] PowerShell no disponible: {e}")
+        logger.error(f"[x] PowerShell no disponible: {e}")
         return False
     
     return True
@@ -179,7 +180,7 @@ def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_
                     resultado = func(*args, timeout=timeout, **kwargs)
                     
                     duracion = (time.time() - inicio) * 1000
-                    logger.info(f"[✓] {func.__name__} ejecutado exitosamente en {duracion:.2f}ms")
+                    logger.info(f"[+] {func.__name__} ejecutado exitosamente en {duracion:.2f}ms")
                     
                     return ResultadoTrigger(
                         exito=True,
@@ -197,7 +198,7 @@ def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_
                         time.sleep(2 ** intento)  # Backoff exponencial
                     
                 except PermissionError as e:
-                    logger.error(f"[✗] {func.__name__} - Permisos insuficientes: {e}")
+                    logger.error(f"[x] {func.__name__} - Permisos insuficientes: {e}")
                     return ResultadoTrigger(
                         exito=False,
                         servicio=func.__name__,
@@ -208,7 +209,7 @@ def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_
                     )
                     
                 except subprocess.CalledProcessError as e:
-                    ultimo_error = f"Proceso falló con código {e.returncode}"
+                    ultimo_error = f"Proceso fallo con codigo {e.returncode}"
                     logger.warning(f"[!] {func.__name__} - Intento {intento}: {ultimo_error}")
                     logger.debug(f"STDERR: {e.stderr}")
                     if intento < reintentos:
@@ -222,12 +223,12 @@ def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_
             
             # Todos los reintentos fallaron
             duracion = (time.time() - inicio) * 1000
-            logger.error(f"[✗] {func.__name__} falló después de {reintentos} intentos: {ultimo_error}")
+            logger.error(f"[x] {func.__name__} fallo despues de {reintentos} intentos: {ultimo_error}")
             
             return ResultadoTrigger(
                 exito=False,
                 servicio=func.__name__,
-                mensaje=f"Falló después de {reintentos} intentos",
+                mensaje=f"Fallo despues de {reintentos} intentos",
                 excepcion=ultimo_error,
                 duracion_ms=duracion,
                 intentos=reintentos
@@ -297,7 +298,7 @@ def ejecutar_cmd(comando: List[str], timeout: int = TIMEOUT_DEFECTO) -> dict:
 
 @manejo_errores(timeout=120, reintentos=2)
 def trigger_defender_scan(timeout: int = TIMEOUT_DEFECTO) -> dict:
-    """Dispara un escaneo rápido de Windows Defender"""
+    """Dispara un escaneo rapido de Windows Defender"""
     comando = "Start-MpScan -ScanType QuickScan -ErrorAction Stop"
     return ejecutar_powershell(comando, timeout)
 
@@ -305,7 +306,7 @@ def trigger_defender_scan(timeout: int = TIMEOUT_DEFECTO) -> dict:
 @manejo_errores(timeout=60, reintentos=2)
 def trigger_defender_update(timeout: int = TIMEOUT_DEFECTO) -> dict:
     """Actualiza definiciones de Windows Defender"""
-    comando = "Update-MpSignature -ErrorAction Stop; Write-Output 'Actualización completada'"
+    comando = "Update-MpSignature -ErrorAction Stop; Write-Output 'Actualizacion completada'"
     return ejecutar_powershell(comando, timeout)
 
 
@@ -397,7 +398,7 @@ def trigger_bluehammer_chain(archivo_destino: str, timeout: int = TIMEOUT_DEFECT
     ]
     
     for nombre_op, cmd in operaciones:
-        logger.info(f"  └─ {nombre_op}...")
+        logger.info(f"  L- {nombre_op}...")
         resultado = ejecutar_powershell(cmd, timeout // len(operaciones))
         logger.debug(f"     Resultado: {resultado['stdout']}")
     
@@ -431,29 +432,29 @@ class DispatcherServicios:
     def validar_estado(self) -> bool:
         """Valida que el entorno sea correcto antes de ejecutar"""
         logger.info("=" * 70)
-        logger.info("VALIDACIÓN DE ENTORNO")
+        logger.info("VALIDACION DE ENTORNO")
         logger.info("=" * 70)
         
         if not validar_entorno():
-            logger.error("[✗] Validación de entorno fallida")
+            logger.error("[x] Validacion de entorno fallida")
             return False
         
         if not validar_permisos():
-            logger.error("[✗] No se pudo obtener permisos de administrador")
+            logger.error("[x] No se pudo obtener permisos de administrador")
             return False
         
-        logger.info("[✓] Entorno validado correctamente")
+        logger.info("[+] Entorno validado correctamente")
         logger.info("=" * 70)
         return True
     
     def trigger(self, servicio: ServicioObjetivo) -> ResultadoTrigger:
         """Dispara un servicio individual"""
-        logger.info(f"\n[→] Disparando: {servicio.value}")
+        logger.info(f"\n[>] Disparando: {servicio.value}")
         
         trigger_fn = self._triggers.get(servicio)
         
         if not trigger_fn:
-            logger.error(f"[✗] Servicio {servicio} no implementado")
+            logger.error(f"[x] Servicio {servicio} no implementado")
             resultado = ResultadoTrigger(
                 exito=False,
                 servicio=servicio.value,
@@ -468,7 +469,7 @@ class DispatcherServicios:
     
     def trigger_multiples(self, servicios: List[ServicioObjetivo]) -> List[ResultadoTrigger]:
         """Dispara múltiples servicios secuencialmente"""
-        logger.info(f"\n[→] Disparando {len(servicios)} servicios...")
+        logger.info(f"\n[>] Disparando {len(servicios)} servicios...")
         resultados = []
         
         for i, servicio in enumerate(servicios, 1):
@@ -526,16 +527,16 @@ class DispatcherServicios:
             return "\n".join(lineas)
         
         elif formato == "txt":
-            lineas = ["=" * 70, "REPORTE DE EJECUCIÓN", "=" * 70]
+            lineas = ["=" * 70, "REPORTE DE EJECUCION", "=" * 70]
             resumen = self.obtener_resumen()
             lineas.append(f"Exitosas: {resumen['exitosas']}/{resumen['total']}")
-            lineas.append(f"Tasa de éxito: {resumen['tasa_exito']:.2f}%")
-            lineas.append(f"Duración total: {resumen['duracion_total_ms']:.2f}ms\n")
+            lineas.append(f"Tasa de exito: {resumen['tasa_exito']:.2f}%")
+            lineas.append(f"Duracion total: {resumen['duracion_total_ms']:.2f}ms\n")
             
             for r in self._resultados:
-                estado = "✓" if r.exito else "✗"
-                lineas.append(f"{estado} {r.servicio}: {r.mensaje}")
-                lineas.append(f"  └─ {r.duracion_ms:.2f}ms ({r.intentos} intento(s))")
+                estado = "+" if r.exito else "x"
+                lineas.append(f"[{estado}] {r.servicio}: {r.mensaje}")
+                lineas.append(f"  L- {r.duracion_ms:.2f}ms ({r.intentos} intento(s))")
             
             return "\n".join(lineas)
         
@@ -549,7 +550,7 @@ class DispatcherServicios:
         ruta = Path(nombre_archivo)
         contenido = self.exportar_resultados("json")
         ruta.write_text(contenido, encoding="utf-8")
-        logger.info(f"[✓] Reporte guardado en: {ruta}")
+        logger.info(f"[+] Reporte guardado en: {ruta}")
 
 
 # ========== PROGRAMA PRINCIPAL ==========
@@ -566,7 +567,7 @@ def main():
         
         # Definir servicios a disparar
         if DRY_RUN:
-            logger.warning("[!] Ejecutándose en modo DRY-RUN - No se realizarán cambios reales")
+            logger.warning("[!] Ejecutandose en modo DRY-RUN - No se realizaran cambios reales")
         
         servicios = [
             ServicioObjetivo.DEFENDER_SCAN,
@@ -585,14 +586,14 @@ def main():
         
         # Mostrar resumen
         logger.info("\n" + "=" * 70)
-        logger.info("RESUMEN DE EJECUCIÓN")
+        logger.info("RESUMEN DE EJECUCION")
         logger.info("=" * 70)
         resumen = dispatcher.obtener_resumen()
         logger.info(f"Total de servicios: {resumen['total']}")
         logger.info(f"Exitosos: {resumen['exitosas']}")
         logger.info(f"Fallidos: {resumen['fallidas']}")
-        logger.info(f"Tasa de éxito: {resumen['tasa_exito']:.2f}%")
-        logger.info(f"Duración total: {resumen['duracion_total_ms']:.2f}ms")
+        logger.info(f"Tasa de exito: {resumen['tasa_exito']:.2f}%")
+        logger.info(f"Duracion total: {resumen['duracion_total_ms']:.2f}ms")
         logger.info("=" * 70)
         
         # Exportar resultados
@@ -605,11 +606,11 @@ def main():
         return 0 if resumen['exitosas'] > 0 else 1
     
     except KeyboardInterrupt:
-        logger.warning("\n[!] Ejecución interrumpida por el usuario")
+        logger.warning("\n[!] Ejecucion interrumpida por el usuario")
         return 130
     
     except Exception as e:
-        logger.exception(f"[✗] Error no controlado: {e}")
+        logger.exception(f"[x] Error no controlado: {e}")
         return 1
 
 

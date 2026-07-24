@@ -1,0 +1,617 @@
+"""
+PoC - Disparador de Servicios Windows con Ejecución Robusta
+Requiere permisos de administrador
+"""
+
+from enum import Enum
+from typing import Callable, Optional, Dict, List
+from dataclasses import dataclass, field, asdict
+from functools import wraps
+import logging
+import logging.handlers
+import subprocess
+import os
+import sys
+import time
+import json
+from datetime import datetime
+from pathlib import Path
+import ctypes
+import tempfile
+
+# ========== CONFIGURACIÓN GLOBAL ==========
+
+# Crear directorio de logs
+LOG_DIR = Path(tempfile.gettempdir()) / "tejon_logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+# Configurar logging con rotación
+log_formatter = logging.Formatter(
+    '[%(asctime)s] [%(levelname)-8s] %(name)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+file_handler = logging.handlers.RotatingFileHandler(
+    LOG_DIR / "tejon_execution.log",
+    maxBytes=10*1024*1024,  # 10MB
+    backupCount=5
+)
+file_handler.setFormatter(log_formatter)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(log_formatter)
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# CONSTANTES
+ARCHIVO_DESTINO = r"C:\temp\target.bin"
+TIMEOUT_DEFECTO = 60  # segundos
+REINTENTOS_DEFECTO = 3
+DRY_RUN = False  # Cambiar a True para modo prueba
+
+
+class ServicioObjetivo(Enum):
+    """Enumeración de servicios disparables"""
+    DEFENDER_SCAN     = "defender_scan"
+    DEFENDER_UPDATE   = "defender_update"
+    WER               = "windows_error_reporting"
+    VSS               = "volume_shadow_copy"
+    MSIEXEC           = "windows_installer"
+    SEARCH_INDEXER    = "search_indexer"
+    CLOUD_FILES       = "cloud_files_filter"
+    BLUEHAMMER        = "bluehammer_chain"
+
+
+@dataclass
+class ResultadoTrigger:
+    """Estructura para retornar resultados del trigger"""
+    exito: bool
+    servicio: str
+    mensaje: str
+    excepcion: Optional[str] = None
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    duracion_ms: float = 0.0
+    stdout: str = ""
+    stderr: str = ""
+    intentos: int = 1
+    
+    def to_dict(self) -> dict:
+        """Convertir a diccionario para serialización"""
+        return asdict(self)
+    
+    def to_json(self) -> str:
+        """Convertir a JSON"""
+        return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
+
+
+# ========== VALIDACIONES PREVIAS ==========
+
+def es_administrador() -> bool:
+    """Verifica si el script se ejecuta con permisos de administrador"""
+    try:
+        return ctypes.windll.shell.IsUserAnAdmin()
+    except:
+        return False
+
+
+def validar_permisos() -> bool:
+    """Valida y eleva permisos si es necesario"""
+    if es_administrador():
+        logger.info("[✓] Script ejecutándose con permisos de administrador")
+        return True
+    
+    logger.warning("[!] Se requieren permisos de administrador")
+    
+    # Intentar elevar permisos (solo en Windows)
+    if sys.platform == "win32":
+        try:
+            logger.info("[*] Intentando elevar permisos con UAC...")
+            ctypes.windll.shell.ShellExecuteW(
+                None, "runas", sys.executable, " ".join(sys.argv), None, 1
+            )
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"[✗] No se pudo elevar permisos: {e}")
+            return False
+    
+    return False
+
+
+def validar_entorno() -> bool:
+    """Valida que el entorno sea compatible"""
+    if sys.platform != "win32":
+        logger.error("[✗] Este PoC solo funciona en Windows")
+        return False
+    
+    if sys.version_info < (3, 8):
+        logger.error("[✗] Se requiere Python 3.8+")
+        return False
+    
+    # Verificar que PowerShell está disponible
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Write-Output 'OK'"],
+            capture_output=True,
+            timeout=5,
+            check=True
+        )
+        logger.info("[✓] PowerShell disponible")
+    except Exception as e:
+        logger.error(f"[✗] PowerShell no disponible: {e}")
+        return False
+    
+    return True
+
+
+# ========== DECORADOR DE MANEJO DE ERRORES ==========
+
+def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_DEFECTO):
+    """
+    Decorador para manejar excepciones, reintentos y timeouts
+    
+    Args:
+        timeout: Segundos máximos de ejecución
+        reintentos: Número de reintentos en caso de fallo
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs) -> ResultadoTrigger:
+            inicio = time.time()
+            ultimo_error = None
+            
+            for intento in range(1, reintentos + 1):
+                try:
+                    if DRY_RUN:
+                        logger.info(f"[DRY-RUN] {func.__name__} ({args}, {kwargs})")
+                        return ResultadoTrigger(
+                            exito=True,
+                            servicio=func.__name__,
+                            mensaje=f"[DRY-RUN] {func.__name__} ejecutado en modo prueba",
+                            duracion_ms=(time.time() - inicio) * 1000,
+                            intentos=intento
+                        )
+                    
+                    logger.info(f"[*] [{intento}/{reintentos}] Iniciando {func.__name__}...")
+                    
+                    resultado = func(*args, timeout=timeout, **kwargs)
+                    
+                    duracion = (time.time() - inicio) * 1000
+                    logger.info(f"[✓] {func.__name__} ejecutado exitosamente en {duracion:.2f}ms")
+                    
+                    return ResultadoTrigger(
+                        exito=True,
+                        servicio=func.__name__,
+                        mensaje=f"{func.__name__} ejecutado exitosamente",
+                        duracion_ms=duracion,
+                        stdout=resultado.get("stdout", "") if isinstance(resultado, dict) else "",
+                        intentos=intento
+                    )
+                    
+                except subprocess.TimeoutExpired:
+                    ultimo_error = f"Timeout excedido ({timeout}s)"
+                    logger.warning(f"[!] {func.__name__} - Intento {intento}: {ultimo_error}")
+                    if intento < reintentos:
+                        time.sleep(2 ** intento)  # Backoff exponencial
+                    
+                except PermissionError as e:
+                    logger.error(f"[✗] {func.__name__} - Permisos insuficientes: {e}")
+                    return ResultadoTrigger(
+                        exito=False,
+                        servicio=func.__name__,
+                        mensaje="Permisos insuficientes",
+                        excepcion=str(e),
+                        duracion_ms=(time.time() - inicio) * 1000,
+                        intentos=intento
+                    )
+                    
+                except subprocess.CalledProcessError as e:
+                    ultimo_error = f"Proceso falló con código {e.returncode}"
+                    logger.warning(f"[!] {func.__name__} - Intento {intento}: {ultimo_error}")
+                    logger.debug(f"STDERR: {e.stderr}")
+                    if intento < reintentos:
+                        time.sleep(2 ** intento)
+                    
+                except Exception as e:
+                    ultimo_error = str(e)
+                    logger.warning(f"[!] {func.__name__} - Intento {intento}: {ultimo_error}")
+                    if intento < reintentos:
+                        time.sleep(2 ** intento)
+            
+            # Todos los reintentos fallaron
+            duracion = (time.time() - inicio) * 1000
+            logger.error(f"[✗] {func.__name__} falló después de {reintentos} intentos: {ultimo_error}")
+            
+            return ResultadoTrigger(
+                exito=False,
+                servicio=func.__name__,
+                mensaje=f"Falló después de {reintentos} intentos",
+                excepcion=ultimo_error,
+                duracion_ms=duracion,
+                intentos=reintentos
+            )
+        
+        return wrapper
+    return decorator
+
+
+# ========== FUNCIONES AUXILIARES ==========
+
+def ejecutar_powershell(comando: str, timeout: int = TIMEOUT_DEFECTO, mostrar_output: bool = False) -> dict:
+    """
+    Ejecuta un comando PowerShell de forma segura
+    
+    Args:
+        comando: Comando PowerShell a ejecutar
+        timeout: Timeout en segundos
+        mostrar_output: Si mostrar salida en tiempo real
+    
+    Returns:
+        dict con stdout, stderr y returncode
+    """
+    try:
+        proceso = subprocess.Popen(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", comando],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        stdout, stderr = proceso.communicate(timeout=timeout)
+        
+        return {
+            "stdout": stdout.strip(),
+            "stderr": stderr.strip(),
+            "returncode": proceso.returncode
+        }
+    
+    except subprocess.TimeoutExpired:
+        proceso.kill()
+        raise
+    except Exception as e:
+        logger.error(f"Error ejecutando PowerShell: {e}")
+        raise
+
+
+def ejecutar_cmd(comando: List[str], timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """Ejecuta comando sin pasar por PowerShell"""
+    resultado = subprocess.run(
+        comando,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False
+    )
+    
+    return {
+        "stdout": resultado.stdout.strip(),
+        "stderr": resultado.stderr.strip(),
+        "returncode": resultado.returncode
+    }
+
+
+# ========== IMPLEMENTACIONES DE TRIGGERS ==========
+
+@manejo_errores(timeout=120, reintentos=2)
+def trigger_defender_scan(timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """Dispara un escaneo rápido de Windows Defender"""
+    comando = "Start-MpScan -ScanType QuickScan -ErrorAction Stop"
+    return ejecutar_powershell(comando, timeout)
+
+
+@manejo_errores(timeout=60, reintentos=2)
+def trigger_defender_update(timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """Actualiza definiciones de Windows Defender"""
+    comando = "Update-MpSignature -ErrorAction Stop; Write-Output 'Actualización completada'"
+    return ejecutar_powershell(comando, timeout)
+
+
+@manejo_errores(timeout=60, reintentos=3)
+def trigger_windows_error_reporting(timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """Habilita Windows Error Reporting"""
+    comando = (
+        "Set-ItemProperty -Path 'HKLM:\\Software\\Microsoft\\Windows\\Windows Error Reporting' "
+        "-Name 'Disabled' -Value 0 -ErrorAction Stop; "
+        "Start-Service WerSvc -ErrorAction SilentlyContinue; "
+        "Write-Output 'WER habilitado'"
+    )
+    return ejecutar_powershell(comando, timeout)
+
+
+@manejo_errores(timeout=120, reintentos=2)
+def trigger_vss_snapshot(timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """Crea snapshot de Volume Shadow Copy en C:"""
+    # Primero validar que vssadmin está disponible
+    resultado = ejecutar_cmd(["vssadmin"], timeout=10)
+    if resultado["returncode"] != 0:
+        raise RuntimeError("vssadmin no disponible")
+    
+    # Crear snapshot
+    resultado = ejecutar_cmd(
+        ["vssadmin", "create", "shadow", "/for=C:"],
+        timeout=timeout
+    )
+    
+    if resultado["returncode"] != 0:
+        raise subprocess.CalledProcessError(
+            resultado["returncode"],
+            "vssadmin",
+            resultado["stderr"]
+        )
+    
+    return resultado
+
+
+@manejo_errores(timeout=60, reintentos=2)
+def trigger_windows_installer(timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """Inicia o reinicia el servicio Windows Installer"""
+    comando = (
+        "Stop-Service -Name msiexec -ErrorAction SilentlyContinue; "
+        "Start-Service -Name msiexec -ErrorAction SilentlyContinue; "
+        "Write-Output 'MSI Installer iniciado'"
+    )
+    return ejecutar_powershell(comando, timeout)
+
+
+@manejo_errores(timeout=60, reintentos=2)
+def trigger_search_indexer(timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """Inicia Windows Search Indexer"""
+    comando = (
+        "Start-Service -Name 'WSearch' -ErrorAction Stop; "
+        "Write-Output 'Windows Search iniciado'"
+    )
+    return ejecutar_powershell(comando, timeout)
+
+
+@manejo_errores(timeout=60, reintentos=2)
+def trigger_cloud_files_filter(timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """Activa Cloud Files Filter Driver"""
+    comando = (
+        "Start-Service -Name 'CldFlt' -ErrorAction Stop; "
+        "Write-Output 'Cloud Files Filter activado'"
+    )
+    return ejecutar_powershell(comando, timeout)
+
+
+@manejo_errores(timeout=90, reintentos=3)
+def trigger_bluehammer_chain(archivo_destino: str, timeout: int = TIMEOUT_DEFECTO) -> dict:
+    """
+    Cadena de operaciones BlueHammer
+    Simula ejecución de múltiples operaciones
+    """
+    logger.info(f"[*] Ejecutando BlueHammer chain con destino: {archivo_destino}")
+    
+    # Validar que el path es válido
+    target_path = Path(archivo_destino)
+    if not target_path.parent.exists():
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Operaciones de BlueHammer
+    operaciones = [
+        ("Preparando sistema", "Write-Output 'Preparando...'"),
+        ("Configurando handlers", "Write-Output 'Configurando...'"),
+        ("Ejecutando chain", f"Write-Output 'Target: {archivo_destino}'"),
+    ]
+    
+    for nombre_op, cmd in operaciones:
+        logger.info(f"  └─ {nombre_op}...")
+        resultado = ejecutar_powershell(cmd, timeout // len(operaciones))
+        logger.debug(f"     Resultado: {resultado['stdout']}")
+    
+    return {
+        "stdout": f"BlueHammer chain completado para {archivo_destino}",
+        "stderr": "",
+        "returncode": 0
+    }
+
+
+# ========== DISPATCHER PRINCIPAL ==========
+
+class DispatcherServicios:
+    """Gestor centralizado de triggers de servicios con características avanzadas"""
+    
+    def __init__(self, dry_run: bool = False):
+        self.dry_run = dry_run
+        self._triggers: Dict[ServicioObjetivo, Callable] = {
+            ServicioObjetivo.DEFENDER_SCAN:     trigger_defender_scan,
+            ServicioObjetivo.DEFENDER_UPDATE:   trigger_defender_update,
+            ServicioObjetivo.WER:               trigger_windows_error_reporting,
+            ServicioObjetivo.VSS:               trigger_vss_snapshot,
+            ServicioObjetivo.MSIEXEC:           trigger_windows_installer,
+            ServicioObjetivo.SEARCH_INDEXER:    trigger_search_indexer,
+            ServicioObjetivo.CLOUD_FILES:       trigger_cloud_files_filter,
+            ServicioObjetivo.BLUEHAMMER:        lambda timeout=TIMEOUT_DEFECTO: trigger_bluehammer_chain(ARCHIVO_DESTINO, timeout=timeout),
+        }
+        self._resultados: List[ResultadoTrigger] = []
+        self._inicio_sesion = datetime.now()
+    
+    def validar_estado(self) -> bool:
+        """Valida que el entorno sea correcto antes de ejecutar"""
+        logger.info("=" * 70)
+        logger.info("VALIDACIÓN DE ENTORNO")
+        logger.info("=" * 70)
+        
+        if not validar_entorno():
+            logger.error("[✗] Validación de entorno fallida")
+            return False
+        
+        if not validar_permisos():
+            logger.error("[✗] No se pudo obtener permisos de administrador")
+            return False
+        
+        logger.info("[✓] Entorno validado correctamente")
+        logger.info("=" * 70)
+        return True
+    
+    def trigger(self, servicio: ServicioObjetivo) -> ResultadoTrigger:
+        """Dispara un servicio individual"""
+        logger.info(f"\n[→] Disparando: {servicio.value}")
+        
+        trigger_fn = self._triggers.get(servicio)
+        
+        if not trigger_fn:
+            logger.error(f"[✗] Servicio {servicio} no implementado")
+            resultado = ResultadoTrigger(
+                exito=False,
+                servicio=servicio.value,
+                mensaje="Servicio no implementado"
+            )
+            self._resultados.append(resultado)
+            return resultado
+        
+        resultado = trigger_fn()
+        self._resultados.append(resultado)
+        return resultado
+    
+    def trigger_multiples(self, servicios: List[ServicioObjetivo]) -> List[ResultadoTrigger]:
+        """Dispara múltiples servicios secuencialmente"""
+        logger.info(f"\n[→] Disparando {len(servicios)} servicios...")
+        resultados = []
+        
+        for i, servicio in enumerate(servicios, 1):
+            logger.info(f"\n[{i}/{len(servicios)}] {servicio.value}")
+            resultado = self.trigger(servicio)
+            resultados.append(resultado)
+            time.sleep(1)  # Pequeña pausa entre servicios
+        
+        return resultados
+    
+    def obtener_resumen(self) -> dict:
+        """Genera resumen de ejecuciones"""
+        if not self._resultados:
+            return {
+                "total": 0,
+                "exitosas": 0,
+                "fallidas": 0,
+                "tasa_exito": 0,
+                "duracion_total_ms": 0
+            }
+        
+        total = len(self._resultados)
+        exitosas = sum(1 for r in self._resultados if r.exito)
+        duracion_total = sum(r.duracion_ms for r in self._resultados)
+        
+        return {
+            "total": total,
+            "exitosas": exitosas,
+            "fallidas": total - exitosas,
+            "tasa_exito": (exitosas / total * 100) if total > 0 else 0,
+            "duracion_total_ms": duracion_total,
+            "duracion_promedio_ms": duracion_total / total if total > 0 else 0,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    def exportar_resultados(self, formato: str = "json") -> str:
+        """Exporta resultados en formato especificado"""
+        if formato == "json":
+            datos = {
+                "sesion": {
+                    "inicio": self._inicio_sesion.isoformat(),
+                    "fin": datetime.now().isoformat(),
+                    "resumen": self.obtener_resumen()
+                },
+                "resultados": [r.to_dict() for r in self._resultados]
+            }
+            return json.dumps(datos, indent=2, ensure_ascii=False)
+        
+        elif formato == "csv":
+            lineas = ["servicio,exito,mensaje,duracion_ms,intentos"]
+            for r in self._resultados:
+                lineas.append(
+                    f'"{r.servicio}",{r.exito},"{r.mensaje}",{r.duracion_ms},{r.intentos}'
+                )
+            return "\n".join(lineas)
+        
+        elif formato == "txt":
+            lineas = ["=" * 70, "REPORTE DE EJECUCIÓN", "=" * 70]
+            resumen = self.obtener_resumen()
+            lineas.append(f"Exitosas: {resumen['exitosas']}/{resumen['total']}")
+            lineas.append(f"Tasa de éxito: {resumen['tasa_exito']:.2f}%")
+            lineas.append(f"Duración total: {resumen['duracion_total_ms']:.2f}ms\n")
+            
+            for r in self._resultados:
+                estado = "✓" if r.exito else "✗"
+                lineas.append(f"{estado} {r.servicio}: {r.mensaje}")
+                lineas.append(f"  └─ {r.duracion_ms:.2f}ms ({r.intentos} intento(s))")
+            
+            return "\n".join(lineas)
+        
+        return ""
+    
+    def guardar_reporte(self, nombre_archivo: str = None):
+        """Guarda reporte en archivo"""
+        if not nombre_archivo:
+            nombre_archivo = LOG_DIR / f"reporte_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        ruta = Path(nombre_archivo)
+        contenido = self.exportar_resultados("json")
+        ruta.write_text(contenido, encoding="utf-8")
+        logger.info(f"[✓] Reporte guardado en: {ruta}")
+
+
+# ========== PROGRAMA PRINCIPAL ==========
+
+def main():
+    """Función principal"""
+    try:
+        # Crear dispatcher
+        dispatcher = DispatcherServicios(dry_run=DRY_RUN)
+        
+        # Validar entorno
+        if not dispatcher.validar_estado():
+            return 1
+        
+        # Definir servicios a disparar
+        if DRY_RUN:
+            logger.warning("[!] Ejecutándose en modo DRY-RUN - No se realizarán cambios reales")
+        
+        servicios = [
+            ServicioObjetivo.DEFENDER_SCAN,
+            ServicioObjetivo.DEFENDER_UPDATE,
+            ServicioObjetivo.VSS,
+            ServicioObjetivo.WER,
+            ServicioObjetivo.BLUEHAMMER
+        ]
+        
+        # Ejecutar disparos
+        logger.info("\n" + "=" * 70)
+        logger.info("INICIANDO DISPAROS DE SERVICIOS")
+        logger.info("=" * 70)
+        
+        resultados = dispatcher.trigger_multiples(servicios)
+        
+        # Mostrar resumen
+        logger.info("\n" + "=" * 70)
+        logger.info("RESUMEN DE EJECUCIÓN")
+        logger.info("=" * 70)
+        resumen = dispatcher.obtener_resumen()
+        logger.info(f"Total de servicios: {resumen['total']}")
+        logger.info(f"Exitosos: {resumen['exitosas']}")
+        logger.info(f"Fallidos: {resumen['fallidas']}")
+        logger.info(f"Tasa de éxito: {resumen['tasa_exito']:.2f}%")
+        logger.info(f"Duración total: {resumen['duracion_total_ms']:.2f}ms")
+        logger.info("=" * 70)
+        
+        # Exportar resultados
+        logger.info("\n[*] Exportando resultados...")
+        dispatcher.guardar_reporte()
+        
+        # Mostrar reporte textual
+        print("\n" + dispatcher.exportar_resultados("txt"))
+        
+        return 0 if resumen['exitosas'] > 0 else 1
+    
+    except KeyboardInterrupt:
+        logger.warning("\n[!] Ejecución interrumpida por el usuario")
+        return 130
+    
+    except Exception as e:
+        logger.exception(f"[✗] Error no controlado: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

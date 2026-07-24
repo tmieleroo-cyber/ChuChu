@@ -124,15 +124,30 @@ class ResultadoTrigger:
 def es_administrador() -> bool:
     """Verifica si el script se ejecuta con permisos de administrador"""
     try:
-        # Intenta acceder a un registro que solo admins pueden acceder
+        # En VirtualBox, usar método más seguro basado en PowerShell
         if ENTORNO == "virtualbox":
-            # En VirtualBox, intentar crear archivo en ProgramData es más seguro
-            test_path = Path(os.environ.get("PROGRAMDATA", "C:\\ProgramData")) / ".admin_test"
-            test_path.touch()
-            test_path.unlink()
-            return True
+            resultado = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", 
+                 "[Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value -match 'S-1-5-32-544'"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return "True" in resultado.stdout or resultado.returncode == 0
         else:
-            return ctypes.windll.shell.IsUserAnAdmin()
+            # En Windows nativo, usar ctypes de forma segura
+            try:
+                return ctypes.windll.shell.IsUserAnAdmin()
+            except:
+                # Fallback a método seguro basado en PowerShell
+                resultado = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", 
+                     "[Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value -match 'S-1-5-32-544'"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                return "True" in resultado.stdout or resultado.returncode == 0
     except Exception as e:
         logger.debug(f"Admin check failed: {e}")
         return False

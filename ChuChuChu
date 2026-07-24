@@ -124,8 +124,17 @@ class ResultadoTrigger:
 def es_administrador() -> bool:
     """Verifica si el script se ejecuta con permisos de administrador"""
     try:
-        return ctypes.windll.shell.IsUserAnAdmin()
-    except:
+        # Intenta acceder a un registro que solo admins pueden acceder
+        if ENTORNO == "virtualbox":
+            # En VirtualBox, intentar crear archivo en ProgramData es más seguro
+            test_path = Path(os.environ.get("PROGRAMDATA", "C:\\ProgramData")) / ".admin_test"
+            test_path.touch()
+            test_path.unlink()
+            return True
+        else:
+            return ctypes.windll.shell.IsUserAnAdmin()
+    except Exception as e:
+        logger.debug(f"Admin check failed: {e}")
         return False
 
 
@@ -137,8 +146,8 @@ def validar_permisos() -> bool:
     
     logger.warning("[!] Se requieren permisos de administrador")
     
-    # Intentar elevar permisos (solo en Windows)
-    if sys.platform == "win32":
+    # Intentar elevar permisos (solo en Windows nativo, no en VirtualBox)
+    if sys.platform == "win32" and ENTORNO != "virtualbox":
         try:
             logger.info("[*] Intentando elevar permisos con UAC...")
             ctypes.windll.shell.ShellExecuteW(
@@ -148,6 +157,9 @@ def validar_permisos() -> bool:
         except Exception as e:
             logger.error(f"[x] No se pudo elevar permisos: {e}")
             return False
+    elif ENTORNO == "virtualbox":
+        logger.warning("[!] En VirtualBox, ejecute el script como Administrador manualmente")
+        return False
     
     return False
 

